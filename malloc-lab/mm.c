@@ -50,6 +50,7 @@ team_t team = {
 #define PACK(size, alloc) ((size) | (alloc))
 #define GET_SIZE(p) (GET(p) & ~0x7) //하위 3개만 0으로 지움 
 #define GET_ALLOC(p) (GET(p) & 0x1) //최하위 1개만 가져옴 
+//참고: 0x7, 0x1은 아무 표시 없는 정수 리터럴이라 int인데 GET(p)는 unsigned int -> int가 unsigned int로 변환된 뒤 연산된다.
 
 //바이트 단위로 포인터 연산하기 위해 block pointer를 char *로 캐스팅 
 //즉, 주소는 char *로 바이트 단위로 다루고, 읽고 쓸 때만 GET/PUT이 4바이트로 해석한다
@@ -58,19 +59,20 @@ team_t team = {
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)))
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE((char *)(bp) - DSIZE)) //이전 footer 위치: bp-8
 
-/*
- * mm_init - initialize the malloc package.
- */
+
 
 static char *prologue_bp; 
 
-static void *extend_heap(size_t size){
-    /*
-        0. 요청 size를 ALIGNMENT 배수로 맞춘다. (0이면 return)
-        1. sbrk로 힙 영역을 늘린다
-        2. 새 영역을 free 블록으로 만든다 -> 주의) 블록 헤더 위치: 이전 에필로그 블럭 위치
-        3. 에필로그 헤더 갱신한다 
-    */
+//-----HEPLER----//
+static char *coalesce(char *bp);
+
+/*
+    0. 요청 size를 ALIGNMENT 배수로 맞춘다. (0이면 return)
+    1. sbrk로 힙 영역을 늘린다
+    2. 새 영역을 free 블록으로 만든다 -> 주의) 블록 헤더 위치: 이전 에필로그 블럭 위치
+    3. 에필로그 헤더 갱신한다 
+*/
+static char *extend_heap(size_t size){
     if(size == 0) return NULL;
     size = ALIGN(size);
 
@@ -80,8 +82,8 @@ static void *extend_heap(size_t size){
     PUT(HDRP(bp), PACK(size, 0)); //블록 헤더   
     PUT(FTRP(bp), PACK(size, 0)); //블록 푸터 
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); //에필로그 헤더 갱신
-
-    return bp; //이전 brk 반환 
+    
+    return coalesce(bp); //병합한 위치 bp 반환 
 }
 
 static void place(char *bp, size_t newsize){
@@ -101,11 +103,44 @@ static void place(char *bp, size_t newsize){
     return;
 }
 
+static char *coalesce(char *bp){
+    unsigned int prev_status = GET_ALLOC(HDRP(PREV_BLKP(bp)));
+    unsigned int next_status = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+    if(prev_status == 1 && next_status == 1) return bp;
+
+    size_t total_size = GET_SIZE(HDRP(bp)); 
+    if(prev_status == 0 && next_status == 0){
+        total_size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp)));
+        bp = PREV_BLKP(bp);
+    } else if(prev_status == 0 && next_status == 1){
+        total_size += GET_SIZE(HDRP(PREV_BLKP(bp)));
+        bp = PREV_BLKP(bp);
+    }else if(prev_status == 1 && next_status == 0){
+        total_size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+    }
+    PUT(HDRP(bp), PACK(total_size, 0));
+    PUT(FTRP(bp), PACK(total_size, 0));
+
+    return bp;
+}
+
+//v1: first_fit 
+static char *find_fit(size_t newsize){
+    for(char *bp = NEXT_BLKP(prologue_bp); GET_SIZE(HDRP(bp)) > 0; bp = (NEXT_BLKP(bp))){
+        if((GET_ALLOC(HDRP(bp)) == 0) && (GET_SIZE(HDRP(bp)) >= newsize)){ //free이고 size보다 큰 블록인 경우 
+            //현재 힙 내 할당 공간 있는 경우 위치 return
+            return bp;
+        }
+    }
+    return NULL;
+}
+
+//-----HEPLER----//
+
+//1. 초기화를 위한 세팅: sbrk로 힙 영역을 받기 -> 4바이트 패딩, prologue 헤더/푸터, epilogue 헤더 세팅
+//2. 힙을 늘린다 -> extend_heap  
 int mm_init(void)
-{
-    //1. 초기화를 위한 세팅: sbrk로 힙 영역을 받기 -> 4바이트 패딩, prologue 헤더/푸터, epilogue 헤더 세팅
-    //2. 힙을 늘린다 -> extend_heap  
-    
+{   
     char *heap_start = (char *)mem_sbrk(PADDING + WSIZE*3);
     if(heap_start == (void *)-1) return -1; 
 
@@ -121,45 +156,51 @@ int mm_init(void)
     return 0;
 }
 
+/*
+    1. size에 헤더+푸터 크기 더하고, 8의 배수로 올리기
+    2. 현재 힙 안에 해당 사이즈를 할당할 수 있는 공간이 있는지 찾기 
+        - first fit: 힙의 처음부터 훑고, 맞는 첫번째 블록 선택
+        - next fit: 직전 검색이 끝난 곳부터 훑기 시작
+        - best fit: 모든 빈 블록을 보고, `맞는 것 중 가장 작은 블록 선택
+    3. 있으면 그곳에 배치 (해당 공간을 쪼갤 수 있는지 확인 필요) 
+        없으면 힙 확장 요청 -> 배치    
+*/
 void *mm_malloc(size_t size)
 {
-    /*
-        1. size에 헤더+푸터 크기 더하고, 8의 배수로 올리기
-        2. 현재 힙 안에 해당 사이즈를 할당할 수 있는 공간이 있는지 찾기 
-            - first fit: 힙의 처음부터 훑고, 맞는 첫번째 블록 선택
-            - next fit: 직전 검색이 끝난 곳부터 훑기 시작
-            - best fit: 모든 빈 블록을 보고, `맞는 것 중 가장 작은 블록 선택
-        3. 있으면 그곳에 배치 (해당 공간을 쪼갤 수 있는지 확인 필요) 
-           없으면 힙 확장 요청 -> 배치    
-    */
-    
     //1. newsize
     if(size == 0) return NULL;
     size_t newsize = ALIGN(size + DSIZE);
    
     //2. 할당 공간 찾기 - first fit
-    for(char *bp = NEXT_BLKP(prologue_bp); GET_SIZE(HDRP(bp)) > 0; bp = (NEXT_BLKP(bp))){
-        if((GET_ALLOC(HDRP(bp)) == 0) && (GET_SIZE(HDRP(bp)) >= newsize)){
-            //3-1. 현재 힙 내 할당 공간 있는 경우 배치 
-            place(bp, newsize); 
-            return bp;
-        }
+    char *bp = find_fit(newsize);
+    if(bp == NULL){
+        //없는 경우 힙 확장 
+        size_t extend_size = newsize > CHUNKSIZE ? newsize : CHUNKSIZE;  
+        bp = extend_heap(extend_size); 
+        if(bp == NULL) return NULL;
     }
-    
-    //3-2. 없는 경우 힙 확장 후 배치
-    size_t extend_size = newsize > CHUNKSIZE ? newsize : CHUNKSIZE;  
-    char *bp = extend_heap(extend_size); 
-    if(bp == NULL) return NULL;
-
-    place(bp, newsize);
-    return bp;
+    place(bp, newsize); //배치 
+    return (void *)bp;
 }
 
 /*
- * mm_free - Freeing a block does nothing.
- */
+    1. 블럭의 상태가 allocated가 맞는지 확인
+    2. ptr이 payload 시작점이 맞는지 확인 -> 이건 나중에.. 지금은 최소 확인만 
+    3. 맞으면 free 및 병합  
+*/
+
 void mm_free(void *ptr)
 {
+    if(ptr == NULL) return;
+
+    if ((GET_ALLOC(HDRP(ptr)) == 1) && (GET(HDRP(ptr)) == GET(FTRP(ptr)))){
+        //현재 블럭 free
+        PUT(HDRP(ptr), PACK(GET_SIZE(HDRP(ptr)), 0));
+        PUT(FTRP(ptr), PACK(GET_SIZE(HDRP(ptr)), 0));
+        
+        //병합
+        coalesce(ptr);
+    }
 }
 
 /*
