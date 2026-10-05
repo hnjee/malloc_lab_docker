@@ -37,11 +37,11 @@ team_t team = {
 
 #define ALIGNMENT 8 //정렬 단위 
 #define ALIGN(size) (((size) + (ALIGNMENT - 1)) & ~0x7) //끝 3비트만 지우는 도장
-#define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 
 #define WSIZE 4 //헤더/푸터 크기
 #define DSIZE 8 //헤더+푸터 크기
 #define PADDING 4 
+#define MIN_BLOCK_SIZE ALIGN(DSIZE + 1)
 #define CHUNKSIZE (1<<12) //힙을 늘리는 기본 단위 (1<<12 = 2의 12제곱 = 4096바이트)
 #define MAX(x,y) ((x) > (y) ? (x) : (y))
 
@@ -65,12 +65,12 @@ team_t team = {
 static char *prologue_bp; 
 
 static void *extend_heap(size_t size){
-    //0. 요청 size를 ALIGNMENT 배수로 맞춘다. (0이면 return)
-    //1. sbrk로 힙 영역을 늘린다
-    //2. 새 영역을 free 블록으로 만든다 -> 주의) 블록 헤더 위치: 이전 에필로그 블럭 위치
-    //3. 에필로그 헤더 갱신한다 
-
-    // 블록 크기는 ALIGNMENT 배수로 맞춰야 함 
+    /*
+        0. 요청 size를 ALIGNMENT 배수로 맞춘다. (0이면 return)
+        1. sbrk로 힙 영역을 늘린다
+        2. 새 영역을 free 블록으로 만든다 -> 주의) 블록 헤더 위치: 이전 에필로그 블럭 위치
+        3. 에필로그 헤더 갱신한다 
+    */
     if(size == 0) return NULL;
     size = ALIGN(size);
 
@@ -81,7 +81,24 @@ static void *extend_heap(size_t size){
     PUT(FTRP(bp), PACK(size, 0)); //블록 푸터 
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); //에필로그 헤더 갱신
 
-    return bp;
+    return bp; //이전 brk 반환 
+}
+
+static void place(char *bp, size_t newsize){
+    size_t block_size = GET_SIZE(HDRP(bp));
+    if(block_size >= newsize + MIN_BLOCK_SIZE){ //쪼개는 조건  
+        PUT(HDRP(bp), PACK(newsize, 1)); //블록1 헤더
+        PUT(FTRP(bp), PACK(newsize, 1)); //블록1 푸터
+        
+        char *bp2 = FTRP(bp)+DSIZE;
+        PUT(HDRP(bp2), PACK(block_size - newsize, 0)); //블록2 헤더
+        PUT(FTRP(bp2), PACK(block_size - newsize, 0)); //블록2 푸터
+        return;
+    }
+    //쪼갤 수 없는 경우 블록 사이즈 그대로 헤더 푸터 갱신
+    PUT(HDRP(bp), PACK(block_size, 1)); //헤더
+    PUT(FTRP(bp), PACK(block_size, 1)); //푸터 
+    return;
 }
 
 int mm_init(void)
@@ -104,23 +121,38 @@ int mm_init(void)
     return 0;
 }
 
-/*
- * mm_malloc - Allocate a block by incrementing the brk pointer.
- *     Always allocate a block whose size is a multiple of the alignment.
- */
 void *mm_malloc(size_t size)
 {
-
-    //1. size
-    int newsize = ALIGN(size + SIZE_T_SIZE);
-    void *p = mem_sbrk(newsize);
-    if (p == (void *)-1)
-        return NULL;
-    else
-    {
-        *(size_t *)p = size;
-        return (void *)((char *)p + SIZE_T_SIZE);
+    /*
+        1. size에 헤더+푸터 크기 더하고, 8의 배수로 올리기
+        2. 현재 힙 안에 해당 사이즈를 할당할 수 있는 공간이 있는지 찾기 
+            - first fit: 힙의 처음부터 훑고, 맞는 첫번째 블록 선택
+            - next fit: 직전 검색이 끝난 곳부터 훑기 시작
+            - best fit: 모든 빈 블록을 보고, `맞는 것 중 가장 작은 블록 선택
+        3. 있으면 그곳에 배치 (해당 공간을 쪼갤 수 있는지 확인 필요) 
+           없으면 힙 확장 요청 -> 배치    
+    */
+    
+    //1. newsize
+    if(size == 0) return NULL;
+    size_t newsize = ALIGN(size + DSIZE);
+   
+    //2. 할당 공간 찾기 - first fit
+    for(char *bp = NEXT_BLKP(prologue_bp); GET_SIZE(HDRP(bp)) > 0; bp = (NEXT_BLKP(bp))){
+        if((GET_ALLOC(HDRP(bp)) == 0) && (GET_SIZE(HDRP(bp)) >= newsize)){
+            //3-1. 현재 힙 내 할당 공간 있는 경우 배치 
+            place(bp, newsize); 
+            return bp;
+        }
     }
+    
+    //3-2. 없는 경우 힙 확장 후 배치
+    size_t extend_size = newsize > CHUNKSIZE ? newsize : CHUNKSIZE;  
+    char *bp = extend_heap(extend_size); 
+    if(bp == NULL) return NULL;
+
+    place(bp, newsize);
+    return bp;
 }
 
 /*
@@ -142,7 +174,7 @@ void *mm_realloc(void *ptr, size_t size)
     newptr = mm_malloc(size);
     if (newptr == NULL)
         return NULL;
-    copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
+    copySize = *(size_t *)((char *)oldptr - DSIZE);
     if (size < copySize)
         copySize = size;
     memcpy(newptr, oldptr, copySize);
