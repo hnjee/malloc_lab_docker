@@ -62,10 +62,9 @@ team_t team = {
 
 
 static char *prologue_bp; 
-
-//-----HEPLER----//
 static char *coalesce(char *bp);
 
+//-----HEPLER START----//
 /*
     0. 요청 size를 ALIGNMENT 배수로 맞춘다. (0이면 return)
     1. sbrk로 힙 영역을 늘린다
@@ -124,18 +123,23 @@ static char *coalesce(char *bp){
     return bp;
 }
 
-//v1: first_fit 
-static char *find_fit(size_t newsize){
-    for(char *bp = NEXT_BLKP(prologue_bp); GET_SIZE(HDRP(bp)) > 0; bp = (NEXT_BLKP(bp))){
-        if((GET_ALLOC(HDRP(bp)) == 0) && (GET_SIZE(HDRP(bp)) >= newsize)){ //free이고 size보다 큰 블록인 경우 
+/*
+    find_fit()
+    - first fit: 힙의 처음부터 훑고, 맞는 첫번째 블록 선택
+    - next fit: 직전 검색이 끝난 곳부터 훑기 시작
+    - best fit: 모든 빈 블록을 보고, 맞는 것 중 가장 작은 블록 선택
+*/
+static char *find_fit(size_t newsize){ //first_fit 
+    char *bp;
+    for(bp = NEXT_BLKP(prologue_bp); GET_SIZE(HDRP(bp)) > 0; bp = (NEXT_BLKP(bp))){
+        if((GET_ALLOC(HDRP(bp)) == 0) && (GET_SIZE(HDRP(bp)) >= newsize)){ 
             //현재 힙 내 할당 공간 있는 경우 위치 return
             return bp;
         }
     }
-    return NULL;
+    return bp; //못찾은 경우 NULL이 아니라 에필로그 블럭 위치 반환 
 }
-
-//-----HEPLER----//
+//-----HEPLER END----//
 
 //1. 초기화를 위한 세팅: sbrk로 힙 영역을 받기 -> 4바이트 패딩, prologue 헤더/푸터, epilogue 헤더 세팅
 //2. 힙을 늘린다 -> extend_heap  
@@ -144,12 +148,12 @@ int mm_init(void)
     char *heap_start = (char *)mem_sbrk(PADDING + WSIZE*3);
     if(heap_start == (void *)-1) return -1; 
 
-    PUT(heap_start, 0); //4바이트 패딩 
+    PUT(heap_start, 0); //4바이트 패딩
     PUT(heap_start + PADDING, PACK(DSIZE, 1)); //prologue 헤더
     PUT(heap_start + PADDING + WSIZE, PACK(DSIZE, 1)); //prologue 푸터
     PUT(heap_start + PADDING + DSIZE, PACK(0, 1)); //epilogue 헤더 
 
-    prologue_bp = heap_start + PADDING + WSIZE; //prologue의 bp로 이동 (푸터 시작지점이 됨)
+    prologue_bp = heap_start + PADDING + WSIZE; //prologue의 bp로 이동
 
     if(extend_heap(CHUNKSIZE) == NULL) return -1;
 
@@ -159,9 +163,6 @@ int mm_init(void)
 /*
     1. size에 헤더+푸터 크기 더하고, 8의 배수로 올리기
     2. 현재 힙 안에 해당 사이즈를 할당할 수 있는 공간이 있는지 찾기 
-        - first fit: 힙의 처음부터 훑고, 맞는 첫번째 블록 선택
-        - next fit: 직전 검색이 끝난 곳부터 훑기 시작
-        - best fit: 모든 빈 블록을 보고, `맞는 것 중 가장 작은 블록 선택
     3. 있으면 그곳에 배치 (해당 공간을 쪼갤 수 있는지 확인 필요) 
         없으면 힙 확장 요청 -> 배치    
 */
@@ -171,11 +172,13 @@ void *mm_malloc(size_t size)
     if(size == 0) return NULL;
     size_t newsize = ALIGN(size + DSIZE);
    
-    //2. 할당 공간 찾기 - first fit
-    char *bp = find_fit(newsize);
-    if(bp == NULL){
-        //없는 경우 힙 확장 
+    //2. 할당 공간 찾기 
+    char *bp = find_fit(newsize); //first-fit, 힙 안에 적합한 블럭이 없는 경우 에필로그 블럭 위치 반환 
+    if(GET_SIZE(HDRP(bp)) == 0){ 
         size_t extend_size = newsize > CHUNKSIZE ? newsize : CHUNKSIZE;  
+        if (GET_ALLOC(HDRP(PREV_BLKP(bp))) == 0){ //힙 마지막 블럭이 free인 경우  
+            extend_size -= GET_SIZE(HDRP(PREV_BLKP(bp))); //할당할 크기 줄이기 
+        }
         bp = extend_heap(extend_size); 
         if(bp == NULL) return NULL;
     }
@@ -185,15 +188,16 @@ void *mm_malloc(size_t size)
 
 /*
     1. 블럭의 상태가 allocated가 맞는지 확인
-    2. ptr이 payload 시작점이 맞는지 확인 -> 이건 나중에.. 지금은 최소 확인만 
-    3. 맞으면 free 및 병합  
+    2. ptr이 payload 시작점이 맞는지 확인 -> 이건 나중에 check 함수? 
+    3. 맞으면 현재 블럭 free
+    4. 병합  
 */
 
 void mm_free(void *ptr)
 {
     if(ptr == NULL) return;
 
-    if ((GET_ALLOC(HDRP(ptr)) == 1) && (GET(HDRP(ptr)) == GET(FTRP(ptr)))){
+    if ((GET_ALLOC(HDRP(ptr)) == 1)){
         //현재 블럭 free
         PUT(HDRP(ptr), PACK(GET_SIZE(HDRP(ptr)), 0));
         PUT(FTRP(ptr), PACK(GET_SIZE(HDRP(ptr)), 0));
