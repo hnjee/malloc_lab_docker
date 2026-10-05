@@ -59,8 +59,6 @@ team_t team = {
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)))
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE((char *)(bp) - DSIZE)) //이전 footer 위치: bp-8
 
-
-
 static char *prologue_bp; 
 static char *coalesce(char *bp);
 
@@ -105,7 +103,6 @@ static void place(char *bp, size_t newsize){
 static char *coalesce(char *bp){
     unsigned int prev_status = GET_ALLOC(HDRP(PREV_BLKP(bp)));
     unsigned int next_status = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
-    if(prev_status == 1 && next_status == 1) return bp;
 
     size_t total_size = GET_SIZE(HDRP(bp)); 
     if(prev_status == 0 && next_status == 0){
@@ -196,33 +193,37 @@ void *mm_malloc(size_t size)
 void mm_free(void *ptr)
 {
     if(ptr == NULL) return;
-
     if ((GET_ALLOC(HDRP(ptr)) == 1)){
-        //현재 블럭 free
-        PUT(HDRP(ptr), PACK(GET_SIZE(HDRP(ptr)), 0));
-        PUT(FTRP(ptr), PACK(GET_SIZE(HDRP(ptr)), 0));
-        
-        //병합
-        coalesce(ptr);
+        coalesce(ptr); //병합 
     }
 }
 
 /*
- * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
+    1. ptr == NULL -> malloc(size) 반환
+    2. size == 0 -> mm_free(ptr) 후 NULL 반환 
+    3. malloc(size) 
+    4. 새로 할당한 공간에 이전 내용 copy 
+        새로 할당하려는 크기가 이전 공간 크기보다 
+        -> 작으면 새로 할당 요청한 크기만큼만 copy (malloc하면 무조건 payload 크기가 요청 크기보다는 크거나 같음)
+        -> 같거나 크면 이전 공간 payload 크기 전부 copy
  */
 void *mm_realloc(void *ptr, size_t size)
 {
-    void *oldptr = ptr;
-    void *newptr;
-    size_t copySize;
-
-    newptr = mm_malloc(size);
-    if (newptr == NULL)
+    if(ptr == NULL) {
+        return mm_malloc(size);
+    }
+    if(size == 0) {
+        mm_free(ptr);
         return NULL;
-    copySize = *(size_t *)((char *)oldptr - DSIZE);
-    if (size < copySize)
-        copySize = size;
-    memcpy(newptr, oldptr, copySize);
-    mm_free(oldptr);
+    }
+
+    void *newptr = mm_malloc(size);
+    if (newptr == NULL) return NULL;
+    
+    size_t copySize = GET_SIZE(HDRP(ptr)) - DSIZE;
+    if (size < copySize) copySize = size;
+    memcpy(newptr, ptr, copySize);
+
+    mm_free(ptr);
     return newptr;
 }
