@@ -135,14 +135,12 @@ static char *coalesce(char *bp){
 }
 
 /*
-    find_fit()
     - first fit: 힙의 처음부터 훑고, 맞는 첫번째 블록 선택
     - next fit: 직전 검색이 끝난 곳부터 훑기 시작
     - best fit: 모든 빈 블록을 보고, 맞는 것 중 가장 작은 블록 선택
 */
 static char *first_fit(size_t newsize){ //first_fit 
-    char *bp;
-    for(bp = NEXT_BLKP(prologue_bp); GET_SIZE(HDRP(bp)) > 0; bp = (NEXT_BLKP(bp))){
+    for(char *bp = NEXT_BLKP(prologue_bp); GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
         if((GET_ALLOC(HDRP(bp)) == 0) && (GET_SIZE(HDRP(bp)) >= newsize)){ 
             //현재 힙 내 할당 공간 있는 경우 위치 return
             return bp;
@@ -151,27 +149,39 @@ static char *first_fit(size_t newsize){ //first_fit
     return NULL; //못찾은 경우 NULL
 }
 
-/*  
-    1. last_search null이면 prologue_bp로 세팅
-    2. last_search부터 시작  
- */
 static char *next_fit(size_t newsize){ //next_fit 
     if (last_search == NULL) last_search = prologue_bp;
     
-    char *bp;
-    for(bp = last_search; GET_SIZE(HDRP(bp)) > 0; bp = (NEXT_BLKP(bp))){
+    for(char *bp = last_search; GET_SIZE(HDRP(bp)) > 0; bp = (NEXT_BLKP(bp))){
         if((GET_ALLOC(HDRP(bp)) == 0) && (GET_SIZE(HDRP(bp)) >= newsize)){
             last_search = bp; 
             return bp;
         }
     }  
-    for(bp = NEXT_BLKP(prologue_bp); bp < last_search; bp = (NEXT_BLKP(bp))){
+    for(char *bp = NEXT_BLKP(prologue_bp); bp < last_search; bp = (NEXT_BLKP(bp))){
         if((GET_ALLOC(HDRP(bp)) == 0) && (GET_SIZE(HDRP(bp)) >= newsize)){ 
             last_search = bp; 
             return bp;
         }
     }
     return NULL; //못찾은 경우 NULL
+}
+
+
+static char *best_fit(size_t newsize){
+    char *best = NULL;
+    for(char *bp = NEXT_BLKP(prologue_bp); GET_SIZE(HDRP(bp)) > 0; bp = NEXT_BLKP(bp)){
+        if((GET_ALLOC(HDRP(bp)) == 0)){ 
+            size_t size = GET_SIZE(HDRP(bp));
+            if(size == newsize){
+                return bp;
+            }
+            if((size > newsize) && (best == NULL || size < GET_SIZE(HDRP(best)))){
+                best = bp;
+            }
+        }
+    }
+    return best;
 }
 //-----HEPLER END----//
 
@@ -208,7 +218,7 @@ void *mm_malloc(size_t size)
     size_t newsize = ALIGN(size + DSIZE);
    
     //2. 할당 공간 찾기 
-    char *bp = next_fit(newsize);
+    char *bp = best_fit(newsize);
     if(bp == NULL){ //현재 힙 내에 공간이 없으면 힙 확장
         bp = extend_heap(newsize); 
         if(bp == NULL) return NULL;
