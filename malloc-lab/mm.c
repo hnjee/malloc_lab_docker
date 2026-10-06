@@ -42,7 +42,7 @@ team_t team = {
 #define DSIZE 8 //헤더+푸터 크기
 #define PADDING 4 
 #define MIN_BLOCK_SIZE ALIGN(DSIZE + 1)
-#define CHUNKSIZE (1<<12) //힙을 늘리는 기본 단위 (1<<12 = 2의 12제곱 = 4096바이트)
+#define CHUNKSIZE (1<<10) //힙을 늘리는 기본 단위 (1<<12 = 2의 12제곱 = 4096바이트)
 #define MAX(x,y) ((x) > (y) ? (x) : (y))
 
 #define GET(p) (*(unsigned int *)(p)) //p가 void *라 unsigned int *로 캐스팅하고 역참조
@@ -59,7 +59,9 @@ team_t team = {
 #define NEXT_BLKP(bp) ((char *)(bp) + GET_SIZE(HDRP(bp)))
 #define PREV_BLKP(bp) ((char *)(bp) - GET_SIZE((char *)(bp) - DSIZE)) //이전 footer 위치: bp-8
 
-static char *prologue_bp; 
+static char *prologue_bp;
+static char *last_search;
+
 static char *coalesce(char *bp);
 
 //-----HEPLER START----//
@@ -71,13 +73,17 @@ static char *coalesce(char *bp);
 */
 static char *extend_heap(size_t size){
     if(size == 0) return NULL;
-    size = ALIGN(size);
+    size_t extend_size = ALIGN(size) > CHUNKSIZE ? ALIGN(size) : CHUNKSIZE;
+    char * last_bp = PREV_BLKP((char *)mem_heap_hi() + 1);  
+    if (GET_ALLOC(HDRP(last_bp)) == 0){ //힙 마지막 블럭이 free인 경우  
+        extend_size -= GET_SIZE(HDRP(last_bp)); //할당할 크기 줄이기 
+    }
 
-    char *bp = (char *)mem_sbrk(size); //이전 brk를 준다
+    char *bp = (char *)mem_sbrk(extend_size); //이전 brk를 준다
     if(bp == (void *)-1) return NULL;
 
-    PUT(HDRP(bp), PACK(size, 0)); //블록 헤더   
-    PUT(FTRP(bp), PACK(size, 0)); //블록 푸터 
+    PUT(HDRP(bp), PACK(extend_size, 0)); //블록 헤더   
+    PUT(FTRP(bp), PACK(extend_size, 0)); //블록 푸터 
     PUT(HDRP(NEXT_BLKP(bp)), PACK(0, 1)); //에필로그 헤더 갱신
     
     return coalesce(bp); //병합한 위치 bp 반환 
@@ -101,22 +107,29 @@ static void place(char *bp, size_t newsize){
 }
 
 static char *coalesce(char *bp){
-    unsigned int prev_status = GET_ALLOC(HDRP(PREV_BLKP(bp)));
-    unsigned int next_status = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+    unsigned int prev_alloc = GET_ALLOC(HDRP(PREV_BLKP(bp)));
+    unsigned int next_alloc = GET_ALLOC(HDRP(NEXT_BLKP(bp)));
+    if(prev_alloc && next_alloc) return bp; //병합할 필요 없음 
 
-    size_t total_size = GET_SIZE(HDRP(bp)); 
-    if(prev_status == 0 && next_status == 0){
-        total_size += GET_SIZE(HDRP(PREV_BLKP(bp))) + GET_SIZE(HDRP(NEXT_BLKP(bp)));
-        bp = PREV_BLKP(bp);
-    } else if(prev_status == 0 && next_status == 1){
+    char *old_bp = bp;
+    char *old_next_bp = NEXT_BLKP(old_bp);
+
+    size_t total_size = GET_SIZE(HDRP(bp));
+    if(prev_alloc && !next_alloc){ // 1 && 0
+        total_size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
+    }else if(!prev_alloc && next_alloc){ // 0 && 1
         total_size += GET_SIZE(HDRP(PREV_BLKP(bp)));
         bp = PREV_BLKP(bp);
-    }else if(prev_status == 1 && next_status == 0){
-        total_size += GET_SIZE(HDRP(NEXT_BLKP(bp)));
-    }
+    }else{ //0 && 0
+        total_size += GET_SIZE(HDRP(NEXT_BLKP(bp))) + GET_SIZE(HDRP(PREV_BLKP(bp)));
+        bp = PREV_BLKP(bp);
+    } 
     PUT(HDRP(bp), PACK(total_size, 0));
     PUT(FTRP(bp), PACK(total_size, 0));
-
+    
+    if(last_search == old_bp || last_search == old_next_bp){
+        last_search = bp;    
+    }
     return bp;
 }
 
@@ -126,7 +139,7 @@ static char *coalesce(char *bp){
     - next fit: 직전 검색이 끝난 곳부터 훑기 시작
     - best fit: 모든 빈 블록을 보고, 맞는 것 중 가장 작은 블록 선택
 */
-static char *find_fit(size_t newsize){ //first_fit 
+static char *first_fit(size_t newsize){ //first_fit 
     char *bp;
     for(bp = NEXT_BLKP(prologue_bp); GET_SIZE(HDRP(bp)) > 0; bp = (NEXT_BLKP(bp))){
         if((GET_ALLOC(HDRP(bp)) == 0) && (GET_SIZE(HDRP(bp)) >= newsize)){ 
@@ -134,7 +147,30 @@ static char *find_fit(size_t newsize){ //first_fit
             return bp;
         }
     }
-    return bp; //못찾은 경우 NULL이 아니라 에필로그 블럭 위치 반환 
+    return NULL; //못찾은 경우 NULL
+}
+
+/*  
+    1. last_search null이면 prologue_bp로 세팅
+    2. last_search부터 시작  
+ */
+static char *next_fit(size_t newsize){ //next_fit 
+    if (last_search == NULL) last_search = prologue_bp;
+    
+    char *bp;
+    for(bp = last_search; GET_SIZE(HDRP(bp)) > 0; bp = (NEXT_BLKP(bp))){
+        if((GET_ALLOC(HDRP(bp)) == 0) && (GET_SIZE(HDRP(bp)) >= newsize)){
+            last_search = bp; 
+            return bp;
+        }
+    }  
+    for(bp = NEXT_BLKP(prologue_bp); bp < last_search; bp = (NEXT_BLKP(bp))){
+        if((GET_ALLOC(HDRP(bp)) == 0) && (GET_SIZE(HDRP(bp)) >= newsize)){ 
+            last_search = bp; 
+            return bp;
+        }
+    }
+    return NULL; //못찾은 경우 NULL
 }
 //-----HEPLER END----//
 
@@ -151,6 +187,7 @@ int mm_init(void)
     PUT(heap_start + PADDING + DSIZE, PACK(0, 1)); //epilogue 헤더 
 
     prologue_bp = heap_start + PADDING + WSIZE; //prologue의 bp로 이동
+    last_search = prologue_bp;
 
     if(extend_heap(CHUNKSIZE) == NULL) return -1;
 
@@ -170,16 +207,15 @@ void *mm_malloc(size_t size)
     size_t newsize = ALIGN(size + DSIZE);
    
     //2. 할당 공간 찾기 
-    char *bp = find_fit(newsize); //first-fit, 힙 안에 적합한 블럭이 없는 경우 에필로그 블럭 위치 반환 
-    if(GET_SIZE(HDRP(bp)) == 0){ 
-        size_t extend_size = newsize > CHUNKSIZE ? newsize : CHUNKSIZE;  
-        if (GET_ALLOC(HDRP(PREV_BLKP(bp))) == 0){ //힙 마지막 블럭이 free인 경우  
-            extend_size -= GET_SIZE(HDRP(PREV_BLKP(bp))); //할당할 크기 줄이기 
-        }
-        bp = extend_heap(extend_size); 
+    char *bp = next_fit(newsize);
+    if(bp == NULL){ //현재 힙 내에 공간이 없으면 힙 확장
+        bp = extend_heap(newsize); 
         if(bp == NULL) return NULL;
     }
-    place(bp, newsize); //배치 
+
+    //3. 찾은 위치에 할당 
+    place(bp, newsize); 
+
     return (void *)bp;
 }
 
@@ -194,7 +230,10 @@ void mm_free(void *ptr)
 {
     if(ptr == NULL) return;
     if ((GET_ALLOC(HDRP(ptr)) == 1)){
-        coalesce(ptr); //병합 
+        PUT(HDRP(ptr), PACK(GET_SIZE(HDRP(ptr)), 0));
+        PUT(FTRP(ptr), PACK(GET_SIZE(HDRP(ptr)), 0));
+
+        coalesce(ptr); //병합
     }
 }
 
