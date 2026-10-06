@@ -98,6 +98,7 @@ static void place(char *bp, size_t newsize){
         char *bp2 = FTRP(bp)+DSIZE;
         PUT(HDRP(bp2), PACK(block_size - newsize, 0)); //블록2 헤더
         PUT(FTRP(bp2), PACK(block_size - newsize, 0)); //블록2 푸터
+        coalesce(bp2);
         return;
     }
     //쪼갤 수 없는 경우 블록 사이즈 그대로 헤더 푸터 갱신
@@ -218,7 +219,6 @@ void *mm_malloc(size_t size)
 
     return (void *)bp;
 }
-
 /*
     1. 블럭의 상태가 allocated가 맞는지 확인
     2. ptr이 payload 시작점이 맞는지 확인 -> 이건 나중에 check 함수? 
@@ -238,6 +238,48 @@ void mm_free(void *ptr)
 }
 
 /*
+    1. ptr, size 체크 
+    2. 새로 할당할 사이즈가 기존 블럭 크기보다 작거나 같으면 -> 거기에 배치
+    3. 큰데, 뒤의 블럭이 free여서 그 블럭까지 합친게 새블럭 크기와 같거나 크면 -> 합치고 거기에 배치
+        -> 크면 -> 아예 새로 malloc   
+*/
+void *mm_realloc(void *ptr, size_t size)
+{
+    if(ptr == NULL) {
+        return mm_malloc(size);
+    }
+    if(size == 0) {
+        mm_free(ptr);
+        return NULL;
+    }
+    
+    //새로 할당할 사이즈가 기존 블럭 크기보다 작거나 같으면 -> 거기에 배치
+    size_t oldsize = GET_SIZE(HDRP(ptr));
+    size_t newsize = ALIGN(size + DSIZE);
+    if(newsize <= oldsize){
+        place(ptr, newsize);
+        return ptr;
+    } 
+
+    size_t total_size = oldsize + GET_SIZE(HDRP(NEXT_BLKP(ptr)));
+    if(!GET_ALLOC(HDRP(NEXT_BLKP(ptr))) && total_size >= newsize){
+        if(last_search == NEXT_BLKP(ptr)){
+            last_search = ptr;
+        }
+        PUT(HDRP(ptr), PACK(total_size, 1));
+        place(ptr, newsize);
+        return ptr;
+    }
+    
+    char *newptr = mm_malloc(size);
+    if(newptr == NULL) return NULL;
+    memcpy(newptr, ptr, oldsize-DSIZE);
+    mm_free(ptr);
+    return newptr;
+}
+
+
+/*
     1. ptr == NULL -> malloc(size) 반환
     2. size == 0 -> mm_free(ptr) 후 NULL 반환 
     3. malloc(size) 
@@ -246,7 +288,7 @@ void mm_free(void *ptr)
         -> 작으면 새로 할당 요청한 크기만큼만 copy (malloc하면 무조건 payload 크기가 요청 크기보다는 크거나 같음)
         -> 같거나 크면 이전 공간 payload 크기 전부 copy
  */
-void *mm_realloc(void *ptr, size_t size)
+void *mm_realloc_v1(void *ptr, size_t size)
 {
     if(ptr == NULL) {
         return mm_malloc(size);
