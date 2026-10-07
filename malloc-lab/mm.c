@@ -91,14 +91,16 @@ static char *extend_heap(size_t size){
 
 static void place(char *bp, size_t newsize){
     size_t block_size = GET_SIZE(HDRP(bp));
+
     if(block_size >= newsize + MIN_BLOCK_SIZE){ //쪼개는 조건  
         PUT(HDRP(bp), PACK(newsize, 1)); //블록1 헤더
         PUT(FTRP(bp), PACK(newsize, 1)); //블록1 푸터
         
-        char *bp2 = FTRP(bp)+DSIZE;
+        char *bp2 = NEXT_BLKP(bp);
         PUT(HDRP(bp2), PACK(block_size - newsize, 0)); //블록2 헤더
         PUT(FTRP(bp2), PACK(block_size - newsize, 0)); //블록2 푸터
         coalesce(bp2);
+
         return;
     }
     //쪼갤 수 없는 경우 블록 사이즈 그대로 헤더 푸터 갱신
@@ -218,7 +220,7 @@ void *mm_malloc(size_t size)
     size_t newsize = ALIGN(size + DSIZE);
    
     //2. 할당 공간 찾기 
-    char *bp = best_fit(newsize);
+    char *bp = next_fit(newsize);
     if(bp == NULL){ //현재 힙 내에 공간이 없으면 힙 확장
         bp = extend_heap(newsize); 
         if(bp == NULL) return NULL;
@@ -250,7 +252,7 @@ void mm_free(void *ptr)
 /*
     1. ptr, size 체크 
     2. 새로 할당할 사이즈가 기존 블럭 크기보다 작거나 같으면 -> 거기에 배치
-    3. 큰데, 뒤의 블럭이 free여서 그 블럭까지 합친게 새블럭 크기와 같거나 크면 -> 합치고 거기에 배치
+    3. 뒤의 블럭이 free여서 그 블럭까지 합친게 새블럭 크기와 같거나 크면 -> 합치고 거기에 배치
         -> 크면 -> 아예 새로 malloc   
 */
 void *mm_realloc(void *ptr, size_t size)
@@ -263,29 +265,74 @@ void *mm_realloc(void *ptr, size_t size)
         return NULL;
     }
     
-    //새로 할당할 사이즈가 기존 블럭 크기보다 작거나 같으면 -> 거기에 배치
     size_t oldsize = GET_SIZE(HDRP(ptr));
     size_t newsize = ALIGN(size + DSIZE);
-    if(newsize <= oldsize){
-        place(ptr, newsize);
-        return ptr;
-    } 
-
-    size_t total_size = oldsize + GET_SIZE(HDRP(NEXT_BLKP(ptr)));
-    if(!GET_ALLOC(HDRP(NEXT_BLKP(ptr))) && total_size >= newsize){
-        if(last_search == NEXT_BLKP(ptr)){
-            last_search = ptr;
-        }
-        PUT(HDRP(ptr), PACK(total_size, 1));
-        place(ptr, newsize);
-        return ptr;
-    }
+    unsigned int nextalloc = GET_ALLOC(HDRP(NEXT_BLKP(ptr)));
+    unsigned int nextsize = GET_SIZE(HDRP(NEXT_BLKP(ptr)));
     
-    char *newptr = mm_malloc(size);
-    if(newptr == NULL) return NULL;
-    memcpy(newptr, ptr, oldsize-DSIZE);
-    mm_free(ptr);
-    return newptr;
+    if(newsize < oldsize){
+        if(nextalloc){ //뒷블럭 allocated이면 배치 
+            place(ptr, newsize);
+        } else{ //뒷블럭 free면 새로운 크기만큼 할당하고 뒷 블럭과 합치기 
+            void *next_ptr = NEXT_BLKP(ptr);
+
+            PUT(HDRP(ptr), PACK(newsize, 1)); //새블록 헤더
+            PUT(FTRP(ptr), PACK(newsize, 1)); //새블록 푸터
+            
+            PUT(HDRP(NEXT_BLKP(ptr)), PACK(oldsize + nextsize - newsize, 0)); //뒷블록 헤더
+            PUT(FTRP(NEXT_BLKP(ptr)), PACK(oldsize + nextsize - newsize, 0)); //뒷블록 푸터
+
+            if(last_search == next_ptr) last_search = NEXT_BLKP(ptr);
+        }
+    } else if(newsize > oldsize){ 
+        if(nextalloc){ 
+            if(nextsize > 0){ //다음블럭이 에피소드블럭이 아닐때 
+                void *newptr = mm_malloc(size);
+                if(newptr == NULL) return NULL;
+                memcpy(newptr, ptr, oldsize-DSIZE);
+                mm_free(ptr);
+                ptr = newptr;
+            } else{ //에피소드 블럭일때 
+                void *newptr = next_fit(newsize);
+                if(newptr != NULL){ //앞에 적합한 블럭이 있으면 
+                    place(newptr, newsize);
+                    memcpy(newptr, ptr, oldsize-DSIZE);
+                    mm_free(ptr);
+                    ptr = newptr;
+                }else{ //꼬리에서 바로 확장 
+                    void *bp = mem_sbrk(newsize - oldsize);
+                    if(bp == (void *)-1) return NULL;
+                    PUT(HDRP(ptr), PACK(newsize, 1)); //new헤더
+                    PUT(FTRP(ptr), PACK(newsize, 1)); //new푸터
+                    PUT(HDRP(NEXT_BLKP(ptr)), PACK(0, 1)); //에필로그 
+                }
+            }            
+        }else{ //!nextalloc
+            size_t block_size = oldsize + nextsize;
+            if(block_size >= newsize){
+                if(block_size >= newsize + MIN_BLOCK_SIZE){
+                    //쪼개기
+                    void *next_ptr = NEXT_BLKP(ptr);
+                    PUT(HDRP(ptr), PACK(newsize, 1));
+                    PUT(FTRP(ptr), PACK(newsize, 1));
+                    PUT(HDRP(NEXT_BLKP(ptr)), PACK(block_size-newsize, 0));
+                    PUT(FTRP(NEXT_BLKP(ptr)), PACK(block_size-newsize, 0));
+                    coalesce(NEXT_BLKP(ptr));
+                    if(last_search == next_ptr) last_search = ptr;
+                } else{
+                    PUT(HDRP(ptr), PACK(block_size, 1));
+                    PUT(FTRP(ptr), PACK(block_size, 1));
+                }
+            } else{ 
+                void *newptr = mm_malloc(size);
+                if(newptr == NULL) return NULL;
+                memcpy(newptr, ptr, oldsize-DSIZE);
+                mm_free(ptr);
+                ptr = newptr;
+            }
+        }
+    }
+    return ptr;
 }
 
 
