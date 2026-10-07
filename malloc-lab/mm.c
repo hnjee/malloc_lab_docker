@@ -42,7 +42,8 @@ team_t team = {
 #define DSIZE 8 //헤더+푸터 크기
 #define PADDING 4 
 #define MIN_BLOCK_SIZE ALIGN(DSIZE + 1)
-#define CHUNKSIZE (1<<10) //힙을 늘리는 기본 단위 (1<<12 = 2의 12제곱 = 4096바이트)
+#define SPLITSIZE (96)
+#define CHUNKSIZE (1<<12) //힙을 늘리는 기본 단위 (1<<12 = 2의 12제곱 = 4096바이트)
 #define MAX(x,y) ((x) > (y) ? (x) : (y))
 
 #define GET(p) (*(unsigned int *)(p)) //p가 void *라 unsigned int *로 캐스팅하고 역참조
@@ -88,24 +89,48 @@ static char *extend_heap(size_t size){
     
     return coalesce(bp); //병합한 위치 bp 반환 
 }
-
 static void place(char *bp, size_t newsize){
     size_t block_size = GET_SIZE(HDRP(bp));
     if(block_size >= newsize + MIN_BLOCK_SIZE){ //쪼개는 조건
         PUT(HDRP(bp), PACK(newsize, 1)); //블록1 헤더
         PUT(FTRP(bp), PACK(newsize, 1)); //블록1 푸터
-        
+
         char *bp2 = NEXT_BLKP(bp);
         PUT(HDRP(bp2), PACK(block_size - newsize, 0)); //블록2 헤더
         PUT(FTRP(bp2), PACK(block_size - newsize, 0)); //블록2 푸터
-        coalesce(bp2);
-        
-        return; 
+    }else{
+        //쪼갤 수 없는 경우 블록 사이즈 그대로 헤더 푸터 갱신
+        PUT(HDRP(bp), PACK(block_size, 1)); //헤더
+        PUT(FTRP(bp), PACK(block_size, 1)); //푸터 
     }
-    //쪼갤 수 없는 경우 블록 사이즈 그대로 헤더 푸터 갱신
-    PUT(HDRP(bp), PACK(block_size, 1)); //헤더
-    PUT(FTRP(bp), PACK(block_size, 1)); //푸터 
     return;
+}
+
+static void *place_for_malloc(char *bp, size_t newsize){
+    size_t block_size = GET_SIZE(HDRP(bp));
+    if(block_size >= newsize + MIN_BLOCK_SIZE){ //쪼개는 조건
+        if(newsize <= SPLITSIZE){ //앞으로 분할
+            PUT(HDRP(bp), PACK(newsize, 1)); //앞블록 헤더
+            PUT(FTRP(bp), PACK(newsize, 1)); //앞블록 푸터
+
+            char *bp2 = NEXT_BLKP(bp);
+            PUT(HDRP(bp2), PACK(block_size - newsize, 0)); //뒷블록 헤더
+            PUT(FTRP(bp2), PACK(block_size - newsize, 0)); //뒷블록 푸터
+        }else{ //뒤로 분할 
+            PUT(HDRP(bp), PACK(block_size - newsize, 0)); //앞블록 헤더
+            PUT(FTRP(bp), PACK(block_size - newsize, 0)); //앞블록 푸터
+
+            char *bp2 = NEXT_BLKP(bp);
+            PUT(HDRP(bp2), PACK(newsize, 1)); //뒷블록 헤더
+            PUT(FTRP(bp2), PACK(newsize, 1)); //뒷블록 푸터
+            return bp2;
+        }
+    }else{
+        //쪼갤 수 없는 경우 블록 사이즈 그대로 헤더 푸터 갱신
+        PUT(HDRP(bp), PACK(block_size, 1)); //헤더
+        PUT(FTRP(bp), PACK(block_size, 1)); //푸터 
+    }
+    return bp;
 }
 
 static char *coalesce(char *bp){
@@ -228,23 +253,22 @@ void *mm_malloc(size_t size)
     size_t newsize = ALIGN(size + DSIZE);
    
     //2. 할당 공간 찾기 
-    char *bp = next_fit(newsize);
+    void *bp = next_fit(newsize);
     if(bp == NULL){ //현재 힙 내에 공간이 없으면 힙 확장
         bp = extend_heap(newsize); 
         if(bp == NULL) return NULL;
     }
 
-    //3. 찾은 위치에 할당 
-    place(bp, newsize); 
-    return (void *)bp;
+    //3. 할당하고 위치 반환 
+    return place_for_malloc(bp, newsize);
 }
+
 /*
     1. 블럭의 상태가 allocated가 맞는지 확인
     2. ptr이 payload 시작점이 맞는지 확인 -> 이건 나중에 check 함수? 
     3. 맞으면 현재 블럭 free
     4. 병합  
 */
-
 void mm_free(void *ptr)
 {
     if(ptr == NULL) return;
@@ -265,9 +289,8 @@ void mm_free(void *ptr)
 */
 void *mm_realloc(void *ptr, size_t size)
 {
-    if(ptr == NULL) {
-        return mm_malloc(size);
-    }
+    if(ptr == NULL) return mm_malloc(size);
+
     if(size == 0) {
         mm_free(ptr);
         return NULL;
@@ -329,35 +352,4 @@ void *mm_realloc(void *ptr, size_t size)
         }
     }
     return ptr;
-}
-
-
-/*
-    1. ptr == NULL -> malloc(size) 반환
-    2. size == 0 -> mm_free(ptr) 후 NULL 반환 
-    3. malloc(size) 
-    4. 새로 할당한 공간에 이전 내용 copy 
-        새로 할당하려는 크기가 이전 공간 크기보다 
-        -> 작으면 새로 할당 요청한 크기만큼만 copy (malloc하면 무조건 payload 크기가 요청 크기보다는 크거나 같음)
-        -> 같거나 크면 이전 공간 payload 크기 전부 copy
- */
-void *mm_realloc_v1(void *ptr, size_t size)
-{
-    if(ptr == NULL) {
-        return mm_malloc(size);
-    }
-    if(size == 0) {
-        mm_free(ptr);
-        return NULL;
-    }
-
-    void *newptr = mm_malloc(size);
-    if (newptr == NULL) return NULL;
-    
-    size_t copySize = GET_SIZE(HDRP(ptr)) - DSIZE;
-    if (size < copySize) copySize = size;
-    memcpy(newptr, ptr, copySize);
-
-    mm_free(ptr);
-    return newptr;
 }
