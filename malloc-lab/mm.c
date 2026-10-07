@@ -91,8 +91,7 @@ static char *extend_heap(size_t size){
 
 static void place(char *bp, size_t newsize){
     size_t block_size = GET_SIZE(HDRP(bp));
-
-    if(block_size >= newsize + MIN_BLOCK_SIZE){ //쪼개는 조건  
+    if(block_size >= newsize + MIN_BLOCK_SIZE){ //쪼개는 조건
         PUT(HDRP(bp), PACK(newsize, 1)); //블록1 헤더
         PUT(FTRP(bp), PACK(newsize, 1)); //블록1 푸터
         
@@ -100,8 +99,8 @@ static void place(char *bp, size_t newsize){
         PUT(HDRP(bp2), PACK(block_size - newsize, 0)); //블록2 헤더
         PUT(FTRP(bp2), PACK(block_size - newsize, 0)); //블록2 푸터
         coalesce(bp2);
-
-        return;
+        
+        return; 
     }
     //쪼갤 수 없는 경우 블록 사이즈 그대로 헤더 푸터 갱신
     PUT(HDRP(bp), PACK(block_size, 1)); //헤더
@@ -185,6 +184,15 @@ static char *best_fit(size_t newsize){
     }
     return best;
 }
+
+static void *relocate_block(void *ptr, size_t size){
+    void *newptr = mm_malloc(size);
+    if(newptr == NULL) return NULL;
+    memcpy(newptr, ptr, GET_SIZE(HDRP(ptr))-DSIZE);
+    mm_free(ptr);
+    return newptr;
+}
+
 //-----HEPLER END----//
 
 //1. 초기화를 위한 세팅: sbrk로 힙 영역을 받기 -> 4바이트 패딩, prologue 헤더/푸터, epilogue 헤더 세팅
@@ -228,7 +236,6 @@ void *mm_malloc(size_t size)
 
     //3. 찾은 위치에 할당 
     place(bp, newsize); 
-
     return (void *)bp;
 }
 /*
@@ -246,6 +253,7 @@ void mm_free(void *ptr)
         PUT(FTRP(ptr), PACK(GET_SIZE(HDRP(ptr)), 0));
 
         coalesce(ptr); //병합
+        
     }
 }
 
@@ -275,31 +283,24 @@ void *mm_realloc(void *ptr, size_t size)
             place(ptr, newsize);
         } else{ //뒷블럭 free면 새로운 크기만큼 할당하고 뒷 블럭과 합치기 
             void *next_ptr = NEXT_BLKP(ptr);
-
             PUT(HDRP(ptr), PACK(newsize, 1)); //새블록 헤더
             PUT(FTRP(ptr), PACK(newsize, 1)); //새블록 푸터
-            
             PUT(HDRP(NEXT_BLKP(ptr)), PACK(oldsize + nextsize - newsize, 0)); //뒷블록 헤더
             PUT(FTRP(NEXT_BLKP(ptr)), PACK(oldsize + nextsize - newsize, 0)); //뒷블록 푸터
-
             if(last_search == next_ptr) last_search = NEXT_BLKP(ptr);
         }
     } else if(newsize > oldsize){ 
         if(nextalloc){ 
-            if(nextsize > 0){ //다음블럭이 에피소드블럭이 아닐때 
-                void *newptr = mm_malloc(size);
-                if(newptr == NULL) return NULL;
-                memcpy(newptr, ptr, oldsize-DSIZE);
-                mm_free(ptr);
-                ptr = newptr;
+            if(nextsize > 0){ 
+                return relocate_block(ptr, size);
             } else{ //에피소드 블럭일때 
                 void *newptr = next_fit(newsize);
-                if(newptr != NULL){ //앞에 적합한 블럭이 있으면 
+                if(newptr != NULL){ //힙 안에 적합한 블럭이 있으면 
                     place(newptr, newsize);
                     memcpy(newptr, ptr, oldsize-DSIZE);
                     mm_free(ptr);
-                    ptr = newptr;
-                }else{ //꼬리에서 바로 확장 
+                    return newptr;
+                }else{ //없으면 꼬리에서 바로 확장 
                     void *bp = mem_sbrk(newsize - oldsize);
                     if(bp == (void *)-1) return NULL;
                     PUT(HDRP(ptr), PACK(newsize, 1)); //new헤더
@@ -310,25 +311,20 @@ void *mm_realloc(void *ptr, size_t size)
         }else{ //!nextalloc
             size_t block_size = oldsize + nextsize;
             if(block_size >= newsize){
+                void *next_ptr = NEXT_BLKP(ptr);
                 if(block_size >= newsize + MIN_BLOCK_SIZE){
                     //쪼개기
-                    void *next_ptr = NEXT_BLKP(ptr);
                     PUT(HDRP(ptr), PACK(newsize, 1));
                     PUT(FTRP(ptr), PACK(newsize, 1));
                     PUT(HDRP(NEXT_BLKP(ptr)), PACK(block_size-newsize, 0));
                     PUT(FTRP(NEXT_BLKP(ptr)), PACK(block_size-newsize, 0));
-                    coalesce(NEXT_BLKP(ptr));
-                    if(last_search == next_ptr) last_search = ptr;
                 } else{
                     PUT(HDRP(ptr), PACK(block_size, 1));
                     PUT(FTRP(ptr), PACK(block_size, 1));
                 }
+                if(last_search == next_ptr) last_search = ptr;
             } else{ 
-                void *newptr = mm_malloc(size);
-                if(newptr == NULL) return NULL;
-                memcpy(newptr, ptr, oldsize-DSIZE);
-                mm_free(ptr);
-                ptr = newptr;
+                return relocate_block(ptr, size);
             }
         }
     }
